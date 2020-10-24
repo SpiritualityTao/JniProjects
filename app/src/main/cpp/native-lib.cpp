@@ -1,10 +1,15 @@
 #include <jni.h>
 #include <string>
 #include <android/log.h>
+#include <pthread.h>
 
 #define TAG "JniProjects"
 // __VA_ARGS__ 代表 ...的可变参数
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG,  __VA_ARGS__);
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG,  __VA_ARGS__);
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG,  __VA_ARGS__);
+
+const char *classPathName = "com/peter/study/jniprojects/MainActivity";
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_peter_study_jniprojects_MainActivity_stringFromJNI(
@@ -144,3 +149,153 @@ Java_com_peter_study_jniprojects_MainActivity_getPerson(JNIEnv *env, jobject thi
 
     return person_obj;
 }
+
+extern "C"
+JNIEXPORT void JNICALL
+native_dynamicRegister(JNIEnv *env, jobject thiz, jstring name) {
+    const char *jname = env->GetStringUTFChars(name, NULL);
+    LOGD("动态注册：%s", jname);
+    env->ReleaseStringUTFChars(name, jname);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+native_handleException(JNIEnv *env, jobject thiz, jstring name) {
+    const char *jname = env->GetStringUTFChars(name, NULL);
+    LOGD("动态注册：%s", jname);
+
+    jclass clazz = env->GetObjectClass(thiz);
+    //执行 Java 测试抛出异常的代码
+    jmethodID mid = env->GetMethodID(clazz, "testException", "()V");
+    // 执行会抛出一个异常
+    env->CallVoidMethod(thiz, mid);
+    // 执行会抛出一个异常
+    jthrowable exc = env->ExceptionOccurred();
+    if(exc) { // 发生
+        // 打印异常
+        env->ExceptionDescribe();
+        // 清楚异常
+        env->ExceptionClear();
+        jclass newExcCls = env->FindClass("java/lang/IllegalArgumentException");
+        //返回一个新的异常到Java
+        env->ThrowNew(newExcCls, "Jni抛出一个异常");
+    }
+
+    env->ReleaseStringUTFChars(name, jname);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+native_count(JNIEnv *env, jobject thiz) {
+    jclass cls = env->GetObjectClass(thiz);
+    jfieldID fieldID = env->GetFieldID(cls, "count", "I");
+
+    if (env->MonitorEnter(thiz) != JNI_OK) {
+        LOGE("%s: MonitorEnter() failed", __FUNCTION__);
+    }
+
+    /* synchronized block */
+    int val = env->GetIntField(thiz, fieldID);
+    val++;
+    LOGI("Native count=%d", val);
+    env->SetIntField(thiz, fieldID, val);
+
+    if (env->ExceptionOccurred()) {
+        LOGE("ExceptionOccurred()...");
+        if (env->MonitorExit(thiz) != JNI_OK) {
+            LOGE("%s: MonitorExit() failed", __FUNCTION__);
+        };
+    }
+
+    if (env->MonitorExit(thiz) != JNI_OK) {
+        LOGE("%s: MonitorExit() failed", __FUNCTION__);
+    };
+}
+
+
+JavaVM * jvm;
+jobject instance;
+void * customThread(void * pVoid) {
+    // 调用的话，一定需要JNIEnv *env
+    // JNIEnv *env 无法跨越线程，只有JavaVM才能跨越线程
+
+    JNIEnv * env = NULL; // 全新的env
+    int result = jvm->AttachCurrentThread(&env, 0); // 把native的线程，附加到JVM
+    if (result != 0) {
+        return 0;
+    }
+
+    jclass mainActivityClass = env->GetObjectClass(instance);
+
+    // 拿到MainActivity的updateUI
+    const char * sig = "()V";
+    jmethodID updateUI = env->GetMethodID(mainActivityClass, "updateUI", sig);
+
+    env->CallVoidMethod(instance, updateUI);
+
+    // 解除 附加 到 JVM 的native线程
+    jvm->DetachCurrentThread();
+
+    return 0;
+}
+
+extern "C"  //支持 C 语言
+JNIEXPORT void JNICALL //告诉虚拟机，这是jni函数
+native_testOriginalThread(JNIEnv *env, jobject thiz) {
+    instance = env->NewGlobalRef(thiz); // 全局的，就不会被释放，所以可以在线程里面用
+    // 如果是非全局的，函数一结束，就被释放了
+    pthread_t pthreadID;
+    pthread_create(&pthreadID, 0, customThread, instance);
+    pthread_join(pthreadID, 0);
+
+}
+
+extern "C"  //支持 C 语言
+JNIEXPORT void JNICALL //告诉虚拟机，这是jni函数
+native_unThread(JNIEnv *env, jobject thiz) {
+
+    if (NULL != instance) {
+        env->DeleteGlobalRef(instance);
+        instance = NULL;
+    }
+
+}
+
+/* 源码结构体
+ * typedef struct {
+    const char* name;
+    const char* signature;
+    void*       fnPtr;
+    } JNINativeMethod;
+ */
+static const JNINativeMethod jniNativeMethod[] = {
+        {"dynamicRegister", "(Ljava/lang/String;)V", (void *) (native_dynamicRegister)},
+        {"handleException", "(Ljava/lang/String;)V", (void *) (native_handleException)},
+        {"nativeCount", "()V", (void *) (native_count)},
+        {"unThread", "()V", (void *) (native_unThread)},
+        {"testOriginalThread", "()V", (void *) (native_testOriginalThread)}
+};
+
+/**
+ * jni.h 文件中，System.loadLibrary会调用此方法
+ * @param vm
+ * @param unused
+ * @return
+ */
+JNIEXPORT jint JNICALL
+JNI_OnLoad(JavaVM *vm, void *unused) {
+
+    jvm = vm;
+    // 通过虚拟机创建新的env
+    JNIEnv *jniEnv = nullptr;
+    jint result = vm->GetEnv(reinterpret_cast<void **>(&jniEnv), JNI_VERSION_1_6);
+    if (result != JNI_OK) {
+       return JNI_ERR;
+    }
+    jclass mainActivityClass = jniEnv->FindClass(classPathName);
+    jniEnv->RegisterNatives(mainActivityClass, jniNativeMethod, sizeof(jniNativeMethod) / sizeof(JNINativeMethod));
+
+    return JNI_VERSION_1_6;
+
+}
+
